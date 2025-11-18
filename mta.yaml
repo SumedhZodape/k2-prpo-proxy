@@ -1,0 +1,67 @@
+_schema-version: "3.1"
+ID: cap-proxy
+version: 1.0.0
+
+modules:
+  # 1. CAP SERVICE MODULE (Backend API)
+  - name: cap-proxy-srv
+    type: nodejs
+    path: .
+    build-parameters:
+      builder: custom
+      commands:
+        - npm install --production
+    requires:
+      - name: cap-proxy-destination
+      - name: cap-proxy-connectivity
+      - name: cap-proxy-xsuaa # Binds XSUAA for JWT validation
+    provides:
+      - name: srv-api # Exposed as a destination for the Approuter
+        properties:
+          url: ${default-url}  
+    parameters:
+      buildpack: nodejs_buildpack
+      memory: 512M
+      disk-quota: 4096M
+
+  # 2. APPLICATION ROUTER MODULE (Frontend Proxy/Security Gateway)
+  - name: cap-proxy-approuter
+    type: approuter.nodejs
+    path: approuter          # Points to the new Approuter folder
+    parameters:
+      disk-quota: 256M
+      memory: 256M
+    requires:
+      # Route all requests to the CAP service
+      - name: srv-api         
+        group: destinations
+        properties:
+          name: srv-api      # Matches the destination name in approuter/xs-app.json
+          url: ~{url}        # Value is the URL exposed by cap-proxy-srv
+      - name: cap-proxy-xsuaa # Binds XSUAA for user authentication
+      - name: cap-proxy-destination # Needed if Approuter uses other destinations
+
+resources:
+  # --- Managed Services ---
+  - name: cap-proxy-destination
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: destination
+      service-plan: lite
+
+  - name: cap-proxy-connectivity
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: connectivity
+      service-plan: lite
+      
+  # --- XSUAA Service Instance ---
+  - name: cap-proxy-xsuaa 
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: xsuaa
+      service-plan: application 
+      path: ./xs-security.json 
+      config:
+        xsappname: cap-po-approval
+        tenant-mode: dedicated

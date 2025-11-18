@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Workflow Approval System</title>
+    <style>
+       
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.1);
+            padding: 40px;
+            max-width: 450px;
+            width: 100%;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .container::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .logo {
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            color: white;
+            font-size: 24px;
+            font-weight: bold;
+        }
+
+        h1 {
+            color: #333;
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .workflow-info {
+            background: #f8f9ff;
+            border-left: 4px solid #667eea;
+            padding: 16px;
+            margin-bottom: 30px;
+            border-radius: 0 8px 8px 0;
+        }
+
+        .workflow-info h3 {
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 16px;
+        }
+
+        .workflow-info p {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 4px;
+        }
+
+        .decision-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .decision-approve {
+            background: #e8f5e8;
+            color: #2e7d2e;
+        }
+
+        .decision-reject {
+            background: #ffe8e8;
+            color: #d32f2f;
+        }
+
+        .processing-container {
+            text-align: center;
+            margin: 30px 0;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .processing-text {
+            color: #666;
+            font-size: 16px;
+            margin-bottom: 10px;
+        }
+
+        .message {
+            margin-top: 20px;
+            padding: 16px;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: 500;
+        }
+
+        .message.success {
+            background: #e8f5e8;
+            color: #2e7d2e;
+            border: 1px solid #c8e6c8;
+        }
+
+        .message.error {
+            background: #ffe8e8;
+            color: #d32f2f;
+            border: 1px solid #ffcdd2;
+        }
+
+        .message.warning {
+            background: #fff3e0;
+            color: #ef6c00;
+            border: 1px solid #ffb74d;
+        }
+
+        .security-notice {
+            background: #e8f5e8;
+            border: 1px solid #c8e6c8;
+            border-radius: 6px;
+            padding: 12px;
+            margin-top: 20px;
+            font-size: 12px;
+            color: #2e7d2e;
+            text-align: center;
+        }
+
+        @media (max-width: 480px) {
+            .container {
+                padding: 30px 20px;
+            }
+            
+            h1 {
+                font-size: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">W</div>
+            <h1>Workflow Approval</h1>
+            <p class="subtitle">SAP S/4HANA System</p>
+        </div>
+
+        <div class="workflow-info">
+            <h3>Task Information</h3>
+            <p><strong>Action:</strong> <span id="decisionText" class="decision-badge">Processing...</span></p>
+            <p><strong>Instance ID:</strong> <span id="instanceIdText">Loading...</span></p>
+        </div>
+
+        <div class="processing-container">
+            <div class="spinner" id="spinner"></div>
+            <p class="processing-text" id="processingText">Processing your request...</p>
+        </div>
+
+        <div class="message" id="message" style="display: none;"></div>
+
+        <div class="security-notice">
+            Using destination-based authentication. Your approval is being processed securely.
+        </div>
+    </div>
+
+    <script>
+        // Parse URL parameters
+        function getUrlParams() {
+            const params = new URLSearchParams(window.location.search);
+            return {
+                instanceId: params.get('instanceId'),
+                decision: params.get('decision')
+            };
+        }
+
+        // Show message
+        function showMessage(text, type) {
+            const messageEl = document.getElementById('message');
+            messageEl.textContent = text;
+            messageEl.className = `message ${type}`;
+            messageEl.style.display = 'block';
+            
+            // Hide processing elements
+            document.getElementById('spinner').style.display = 'none';
+            document.getElementById('processingText').style.display = 'none';
+        }
+
+        // Process workflow decision automatically
+        async function processWorkflowDecision() {
+            const params = getUrlParams();
+            
+            if (!params.instanceId || !params.decision) {
+                showMessage('Invalid URL parameters. Please use the link from your email.', 'error');
+                return;
+            }
+
+            // Display decision information
+            const decisionElement = document.getElementById('decisionText');
+            const instanceElement = document.getElementById('instanceIdText');
+            instanceElement.textContent = params.instanceId;
+            
+            if (params.decision === '0001') {
+                decisionElement.textContent = 'Approve';
+                decisionElement.className = 'decision-badge decision-approve';
+            } else if (params.decision === '0002') {
+                decisionElement.textContent = 'Reject';
+                decisionElement.className = 'decision-badge decision-reject';
+            } else {
+                decisionElement.textContent = 'Unknown';
+                showMessage('Invalid decision parameter.', 'error');
+                return;
+            }
+
+            try {
+                console.log('Processing workflow decision:', {
+                    instanceId: params.instanceId,
+                    decision: params.decision
+                });
+
+                // Call CAP service
+                const response = await fetch('/odata/v4/approval/processWorkflowDecision', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        instanceId: params.instanceId,
+                        decision: params.decision,
+                        comments: params.decision === '0001' ? 'Approved via workflow system' : 'Rejected via workflow system'
+                    })
+                });
+
+                console.log('Response status:', response.status);
+
+                let result;
+                try {
+                    result = await response.json();
+                    console.log('Response data:', result);
+                } catch (parseError) {
+                    console.error('Failed to parse JSON response:', parseError);
+                    throw new Error('Invalid JSON response from server');
+                }
+                
+                // Check for successful response
+                if (response.ok) {
+                    let successData = null;
+                    let message = '';
+
+                    // Handle different response structures
+                    if (result.value) {
+                        successData = result.value;
+                    } else if (result.success !== undefined) {
+                        successData = result;
+                    } else if (result.d) {
+                        successData = result.d;
+                    }
+
+                    if (successData && successData.success === true) {
+                        message = successData.message || (params.decision === '0001' ? 'Task approved successfully' : 'Task rejected successfully');
+                        showMessage('' + message, 'success');
+                    } else if (successData && successData.success === false) {
+                        message = successData.message || 'Workflow processing failed';
+                        showMessage('' + message, 'error');
+                    } else {
+                        showMessage('Workflow processed, but response format is unexpected. Please check S/4HANA for confirmation.', 'warning');
+                    }
+                } else {
+                    // Handle HTTP error responses
+                    let errorMessage = 'Failed to process decision';
+                    
+                    if (response.status === 401) {
+                        errorMessage = 'Authentication failed. Please check destination configuration.';
+                    } else if (response.status === 404) {
+                        errorMessage = 'Workflow instance not found or service endpoint not available.';
+                    } else if (response.status === 403) {
+                        errorMessage = 'You are not authorized to approve/reject this workflow.';
+                    } else if (response.status === 400) {
+                        errorMessage = 'Bad request. Please check the workflow instance ID and decision parameters.';
+                    } else if (result && result.error && result.error.message) {
+                        errorMessage = '' + result.error.message;
+                    } else {
+                        errorMessage = `Server error (${response.status}): ${response.statusText}`;
+                    }
+                    
+                    showMessage(errorMessage, 'error');
+                }
+            } catch (error) {
+                console.error('Network/Request Error:', error);
+                showMessage('Network error. Please check your connection and try again.', 'error');
+            }
+        }
+
+        // Process workflow decision when page loads
+        document.addEventListener('DOMContentLoaded', processWorkflowDecision);
+    </script>
+    
+</body>
+</html>

@@ -1,0 +1,12 @@
+# Example content for .cfignore in the 'srv' folder
+# Exclude the entire node_modules folder
+node_modules/
+
+# Exclude source control files
+.git
+.gitignore
+
+# Exclude various temporary or build artifacts
+*.log
+.DS_Store
+dist/

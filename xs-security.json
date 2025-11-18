@@ -1,0 +1,45 @@
+{
+  "xsappname": "cap-po-approval",
+  "tenant-mode": "dedicated",
+  "description": "Security descriptor for CAP Purchase Order Approval",
+  "scopes": [
+    {
+      "name": "$XSAPPNAME.Admin",
+      "description": "Admin scope for purchase order approval"
+    },
+    {
+      "name": "$XSAPPNAME.Approver",
+      "description": "Approver scope for purchase order approval"
+    },
+    {
+      "name": "$XSAPPNAME.Requester",
+      "description": "Requester scope for purchase order approval"
+    }
+  ],
+  "role-templates": [
+    {
+      "name": "Admin",
+      "description": "Administrator role",
+      "scope-references": [
+        "$XSAPPNAME.Admin",
+        "$XSAPPNAME.Approver",
+        "$XSAPPNAME.Requester"
+      ]
+    },
+    {
+      "name": "Approver",
+      "description": "Approver role",
+      "scope-references": [
+        "$XSAPPNAME.Approver",
+        "$XSAPPNAME.Requester"
+      ]
+    },
+    {
+      "name": "Requester",
+      "description": "Requester role",
+      "scope-references": [
+        "$XSAPPNAME.Requester"
+      ]
+    }
+  ]
+}

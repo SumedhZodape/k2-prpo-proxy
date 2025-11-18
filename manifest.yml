@@ -1,0 +1,13 @@
+---
+applications:
+  - name: cap-proxy
+    memory: 512M
+    buildpacks:
+      - nodejs_buildpack
+    random-route: false
+    services:
+      - cap-proxy-destination
+      - cap-proxy-connectivity
+      - cap-proxy-xsuaa
+    env:
+      NODE_ENV: production

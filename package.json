@@ -1,0 +1,64 @@
+{
+  "name": "cap-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "cds-serve",
+    "watch": "cds watch",
+    "build": "cds build"
+  },
+  "dependencies": {
+    "@cap-js/sqlite": "^2.0.4",
+    "@sap-cloud-sdk/connectivity": "^4.1.2",
+    "@sap-cloud-sdk/http-client": "^3.21.0",
+    "@sap-cloud-sdk/resilience": "^4.1.2",
+    "@sap-cloud-sdk/util": "^4.1.2",
+    "@sap/cds": "^9.2.0",
+    "@sap/xssec": "^4.11.2",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "multer": "^2.0.2",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "cds": {
+    "requires": {
+      "auth": {
+        "[production]": {
+          "kind": "xsuaa"
+        },
+        "[development]": {
+          "kind": "mocked"
+        }
+      },
+      "db": {
+        "kind": "sqlite",
+        "credentials": {
+          "url": "db.sqlite"
+        }
+      },
+      "S4-API": {
+        "kind": "odata-v2",
+        "credentials": {
+          "destination": "S4-API",
+          "requestTimeout": 120000
+        },
+        "pool": {
+          "min": 2,
+          "max": 10,
+          "acquireTimeoutMillis": 30000,
+          "idleTimeoutMillis": 30000
+        }
+      }
+    },
+    "build": {
+      "target": "gen"
+    },
+    "server": {
+      "port": 4004,
+      "keepAliveTimeout": 150000
+    }
+  }
+}
