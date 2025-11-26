@@ -15,6 +15,7 @@
     "@sap-cloud-sdk/util": "^4.1.2",
     "@sap/cds": "^9.2.0",
     "@sap/xssec": "^4.11.2",
+    "big.js": "^7.0.1",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "multer": "^2.0.2",
@@ -39,10 +40,10 @@
           "url": "db.sqlite"
         }
       },
-      "S4-API": {
+      "S4-API-QAS": {
         "kind": "odata-v2",
         "credentials": {
-          "destination": "S4-API",
+          "destination": "S4-API-QAS",
           "requestTimeout": 120000
         },
         "pool": {

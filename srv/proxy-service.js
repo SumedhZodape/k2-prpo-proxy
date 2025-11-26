@@ -2,6 +2,7 @@ const cds = require('@sap/cds');
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
+const Big = require("big.js");
 
 
 // =======================================================================
@@ -66,7 +67,7 @@ class CSRFTokenCache {
             // Fetch new token
             const { executeHttpRequest } = require('@sap-cloud-sdk/http-client');
             const csrfResponse = await executeHttpRequest(
-                { destinationName: 'S4-API' },
+                { destinationName: 'S4-API-QAS' },
                 {
                     method: 'GET',
                     url: service,
@@ -150,7 +151,7 @@ async function executeS4Request(config, retries = 2) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
             return await s4RequestQueue.add(() =>
-                executeHttpRequest({ destinationName: 'S4-API' }, config)
+                executeHttpRequest({ destinationName: 'S4-API-QAS' }, config)
             );
         } catch (error) {
             console.error(`[S4 Request] Attempt ${attempt}/${retries} failed:`, error.message);
@@ -394,7 +395,7 @@ module.exports = cds.service.impl(async function () {
             console.log('=== PO Creation Started ===');
             const poPayload = req.body;
 
-            // Validation check
+            // Validation
             if (!poPayload || !poPayload.context || !poPayload.context.prRequisitionInputs) {
                 return res.status(400).json({
                     success: false,
@@ -403,86 +404,103 @@ module.exports = cds.service.impl(async function () {
                 });
             }
 
-            // Extract the source data object
             const sourceData = poPayload.context.prRequisitionInputs;
 
-            // --- Logic Determinations ---
-            const poType = determinePurchaseOrderType(sourceData.CompanyId, sourceData.Budgeted);
-            const purchasingOrg = determinePurchasingOrganisation(sourceData.CompanyId);
-            const poDateOData = convertDateToODataFormat(sourceData.Estimated_DeliveryDate); // Assuming header date comes from a source field
+            // ------------------------------
+            // ⭐ NEW FUNCTION — DISCOUNT LOGIC (Converted from Groovy)
+            // ------------------------------
+            function calculateFinalAmount(item, sourceData) {
+                const Big = require("big.js");
 
-            // --- Dynamic Item Mapping ---
+                const unitPrice = item.UnitPrice ? Big(item.UnitPrice) : Big(0);
+                const quantity = item.Quantity ? Big(item.Quantity) : Big(0);
+
+                const discountPerc = item.Discount ? Big(item.Discount) : Big(0);
+                const discountAmt = item.DiscountAmt ? Big(item.DiscountAmt) : Big(0);
+
+                const globalPerc = sourceData.LumpsumDiscount ? Big(sourceData.LumpsumDiscount) : Big(0);
+                const globalAmt = sourceData.LumpsumDiscountAmt ? Big(sourceData.LumpsumDiscountAmt) : Big(0);
+
+                const applyAmountDiscount = globalAmt.gt(0);
+                const applyPercentDiscount = (!applyAmountDiscount && globalPerc.gt(0));
+
+                // BASE AMOUNT = unitPrice * qty
+                let base = unitPrice.times(quantity);
+
+                // -------- ITEM LEVEL DISCOUNT --------
+                let afterItem = base;
+
+                if (discountPerc.gt(0)) {
+                    const discValue = base.times(discountPerc).div(100);
+                    afterItem = base.minus(discValue);
+                } else if (discountAmt.gt(0)) {
+                    afterItem = base.minus(discountAmt);
+                }
+
+                // -------- GLOBAL LEVEL DISCOUNT --------
+                let finalAmount = afterItem;
+
+                if (applyAmountDiscount) {
+                    finalAmount = finalAmount.minus(globalAmt);
+                } else if (applyPercentDiscount) {
+                    const globalValue = finalAmount.times(globalPerc).div(100);
+                    finalAmount = finalAmount.minus(globalValue);
+                }
+
+                // ⭐ Precision = Scale 3
+                return finalAmount.round(2, 0).toString();
+            }
+
+            // ------------------------------
+            // Dynamic Item Mapping (UPDATED with Amount Calculation)
+            // ------------------------------
             const itemResults = sourceData.Item && sourceData.Item.length > 0
                 ? sourceData.Item.map((item, index) => {
+
                     const itemNumber = String((index + 1) * 10).padStart(5, '0');
-                    const conditionType = item.ConditionType || ""; // Assuming ConditionType is on the item level
 
-                    // Determine Pricing Value
-                    const conditionRateValue = determineConditionRateValue(
-                        conditionType,
-                        item.Discount,
-                        item.DiscountAmt,
-                        sourceData.LumpsumDiscount,
-                        sourceData.LumpsumDiscountAmt
-                    );
+                    // ⭐ Call Discount Logic
+                    const finalAmount = calculateFinalAmount(item, sourceData);
 
-                    // Build Pricing Element (only if rate is not zero)
-                    const pricingElement = (conditionRateValue !== "0" && conditionType)
-                        ? {
-                            to_PurchaseOrderPricingElement: {
-                                results: [{
-                                    ConditionType: conditionType,
-                                    ConditionRateValue: conditionRateValue,
-                                }]
-                            }
-                        }
-                        : {}; // Empty object if no pricing element is needed
-
-                    // Build Schedule Line
-                    const scheduleLineOData = convertDateToODataFormat(item.LineEstDelivDate);
+                    // Schedule line
                     const scheduleLine = {
                         to_ScheduleLine: {
                             results: [{
-                                ScheduleLineDeliveryDate: scheduleLineOData,
+                                ScheduleLineDeliveryDate: convertDateToODataFormat(item.LineEstDelivDate)
                             }]
                         }
                     };
 
-                    // Build Account Assignment
+                    // Account assignment
                     const accountAssignment = {
                         to_AccountAssignment: {
-                            results: [
-                                {
-                                    PurchaseOrder: "",
-                                    PurchaseOrderItem: itemNumber,
-                                    AccountAssignmentNumber: "1",
-                                    Quantity: String(item.Quantity || 0),
-                                    GLAccount: item.GLaccount || "",
-                                    CostCenter: item.CostCenter || "",
-                                    MasterFixedAsset: item.AssetCode || "",
-                                    OrderID: item.NominalCode || ""
-                                }
-                            ]
+                            results: [{
+                                PurchaseOrder: "",
+                                PurchaseOrderItem: itemNumber,
+                                AccountAssignmentNumber: "1",
+                                Quantity: String(item.Quantity || 0),
+                                GLAccount: item.GLaccount || "",
+                                CostCenter: item.CostCenter || "",
+                                MasterFixedAsset: item.AssetCode || "",
+                                OrderID: item.NominalCode || ""
+                            }]
                         }
                     };
 
-                    // Return the complete item payload
                     return {
                         "PurchaseOrder": "",
-                        "PurchaseOrderItem": itemNumber, // Dynamic Counter
-                        "Plant": sourceData.CompanyId || "",
+                        "PurchaseOrderItem": itemNumber,
+                        "Plant": sourceData.CompanyId,
                         "ProductType": "1",
                         "MaterialGroup": item.MaterialGroup || "",
                         "OrderQuantity": String(item.Quantity || 0),
-                        "NetPriceAmount": String(item.UnitPrice || 0),
+                        "NetPriceAmount": finalAmount,     // ⭐ UPDATED
                         "OrderPriceUnit": "EA",
                         "DocumentCurrency": sourceData.Currency_Code || "",
                         "NetPriceQuantity": "1",
                         "RequisitionerName": sourceData.RequestorName || "",
                         "PurchaseOrderItemText": item.ItemDescription || "",
-                        "AccountAssignmentCategory": (item.AssetAccountAssignmentCategory && item.AssetAccountAssignmentCategory.toUpperCase() === "A")
-                            ? "A"
-                            : "K",
+                        "AccountAssignmentCategory": (item.AssetAccountAssignmentCategory == "A") ? "A" : "K",
                         "GoodsReceiptIsNonValuated": true,
                         "PurchaseOrderItemCategory": "0",
                         "PurchaseOrderQuantityUnit": "EA",
@@ -491,147 +509,112 @@ module.exports = cds.service.impl(async function () {
                         "GoodsReceiptIsExpected": true,
                         "ReferenceDeliveryAddressID": sourceData.Delivery_Address || "",
                         "InvoiceIsGoodsReceiptBased": true,
-                        ...accountAssignment, // Nested structure
-                        ...pricingElement,  // Nested structure
-                        ...scheduleLine     // Nested structure
+                        ...accountAssignment,
+                        ...scheduleLine
                     };
                 })
-                : []; // Empty array if no items exist
+                : [];
 
-
-            // --- Final Payload Construction (A_PurchaseOrder) ---
+            // ------------------------------
+            // Main Payload
+            // ------------------------------
             const mainPayload = {
-                "A_PurchaseOrder": {
-                    "PurchaseOrder": "",
-                    "PurchaseOrderType": poType,
-                    "CompanyCode": sourceData.CompanyId || "",
-                    "Supplier": sourceData.Vendor_Recommendation || "",
-                    "Language": "EN",
-                    "PaymentTerms": "0030",
-                    "PurchasingGroup": sourceData.PurchasingGroup || "",
-                    "DocumentCurrency": sourceData.Currency_Code || "",
-                    "PurchaseOrderDate": convertDateToODataFormat(new Date()),
-                    "PurchasingOrganization": purchasingOrg, // Determined dynamically
-                    "PurchasingDocumentOrigin": "9",
-                    "SupplierRespSalesPersonName": `${sourceData.PRNumber || ''} - Created`,
-                    "to_PurchaseOrderItem": {
-                        "results": itemResults // Populated by the dynamic mapping
-                    },
-                    "ReleaseIsNotCompleted": true,
-                    "PurchasingCompletenessStatus": false
-                }
+                "PurchaseOrder": "",
+                "PurchaseOrderType": determinePurchaseOrderType(sourceData.CompanyId, sourceData.Budgeted),
+                "CompanyCode": sourceData.CompanyId || "",
+                "Supplier": sourceData.Vendor_Recommendation || "",
+                "Language": "EN",
+                "PaymentTerms": "0030",
+                "PurchasingGroup": sourceData.PurchasingGroup || "",
+                "DocumentCurrency": sourceData.Currency_Code || "",
+                "PurchaseOrderDate": convertDateToODataFormat(new Date()),
+                "PurchasingOrganization": determinePurchasingOrganisation(sourceData.CompanyId),
+                "PurchasingDocumentOrigin": "9",
+                "SupplierRespSalesPersonName": `${sourceData.PRNumber || ''} - Created`,
+                "to_PurchaseOrderItem": { "results": itemResults },
+                "ReleaseIsNotCompleted": true,
+                "PurchasingCompletenessStatus": false
             };
-
-
-
 
             const poResponse = await executeS4Request({
                 method: 'POST',
                 url: '/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder',
+                data: mainPayload,
                 headers: {
                     'X-Requested-With': 'X',
                     'Content-Type': 'application/json',
                     'Accept': 'application/json'
                 },
-                data: mainPayload.A_PurchaseOrder,
                 timeout: 90000
             });
 
             const createdPOData = poResponse.data?.d || poResponse.data;
-            const poNumber = createdPOData?.PurchaseOrder || 'Unknown';
+            const poNumber = createdPOData?.PurchaseOrder || "Unknown";
 
-            console.log('✓ PO Created:', poNumber);
+            console.log("✓ PO Created:", poNumber);
+            const header = createdPOData;
 
-            // The desired final structure
+            // Final Structure
             const transformedResponse = {
-                A_PurchaseOrder: {
-                    A_PurchaseOrderType: {}
+                "A_PurchaseOrder": {
+                    "A_PurchaseOrderType": {
+                        "CreationDate": header.CreationDate || "",
+                        "CreatedByUser": header.CreatedByUser || "",
+                        "IsEndOfPurposeBlocked": header.IsEndOfPurposeBlocked || "",
+                        "PurchasingCompletenessStatus": String(header.PurchasingCompletenessStatus || false),
+                        "CashDiscount1Days": header.CashDiscount1Days || "",
+                        "PurchaseOrderType": header.PurchaseOrderType || "",
+                        "PurchasingOrganization": header.PurchasingOrganization || "",
+                        "PurchasingDocumentDeletionCode": header.PurchasingDocumentDeletionCode || "",
+                        "NetPaymentDays": header.NetPaymentDays || "",
+                        "ManualSupplierAddressID": header.ManualSupplierAddressID || "",
+                        "IncotermsVersion": header.IncotermsVersion || "",
+                        "AddressRegion": header.AddressRegion || "",
+                        "PurchasingGroup": header.PurchasingGroup || "",
+                        "IncotermsClassification": header.IncotermsClassification || "",
+                        "AddressName": header.AddressName || "",
+                        "InvoicingParty": header.InvoicingParty || "",
+                        "SupplyingPlant": header.SupplyingPlant || "",
+                        "PurchasingDocumentOrigin": header.PurchasingDocumentOrigin || "",
+                        "AddressCityName": header.AddressCityName || "",
+                        "AddressStreetName": header.AddressStreetName || "",
+                        "CashDiscount2Percent": header.CashDiscount2Percent || "",
+                        "ValidityStartDate": header.ValidityStartDate || "",
+                        "ExchangeRate": header.ExchangeRate || "",
+                        "SupplyingSupplier": header.SupplyingSupplier || "",
+                        "PaymentTerms": header.PaymentTerms || "",
+                        "AddressCountry": header.AddressCountry || "",
+                        "AddressPostalCode": header.AddressPostalCode || "",
+                        "PurchaseOrderSubtype": header.PurchaseOrderSubtype || "",
+                        "Language": header.Language || "",
+                        "SupplierRespSalesPersonName": header.SupplierRespSalesPersonName || "",
+                        "SupplierQuotationExternalID": header.SupplierQuotationExternalID || "",
+                        "Supplier": header.Supplier || "",
+                        "ValidityEndDate": header.ValidityEndDate || "",
+                        "IncotermsLocation2": header.IncotermsLocation2 || "",
+                        "IncotermsLocation1": header.IncotermsLocation1 || "",
+                        "AddressFaxNumber": header.AddressFaxNumber || "",
+                        "AddressPhoneNumber": header.AddressPhoneNumber || "",
+                        "AddressCorrespondenceLanguage": header.AddressCorrespondenceLanguage || "",
+                        "DocumentCurrency": header.DocumentCurrency || "",
+                        "ReleaseIsNotCompleted": String(header.ReleaseIsNotCompleted || false),
+                        "PurchaseOrderDate": header.PurchaseOrderDate || "",
+                        "PurchasingProcessingStatus": header.PurchasingProcessingStatus || "",
+                        "PurchaseOrder": header.PurchaseOrder || "",
+                        "LastChangeDateTime": header.LastChangeDateTime || "",
+                        "SupplierPhoneNumber": header.SupplierPhoneNumber || "",
+                        "CashDiscount2Days": header.CashDiscount2Days || "",
+                        "CompanyCode": header.CompanyCode || "",
+                        "CashDiscount1Percent": header.CashDiscount1Percent || "",
+                        "AddressHouseNumber": header.AddressHouseNumber || ""
+                    }
                 }
             };
 
-            // Get the inner object for easier mapping
-            const targetObject = transformedResponse.A_PurchaseOrder.A_PurchaseOrderType;
-
-            // Mapping properties from createdPOData to targetObject
-            // Note: Data types (string, boolean) might need conversion/coercion 
-            // to match the exact string format of your desired output.
-
-            // Example Mapping (Based on your desired output keys):
-            targetObject.CreationDate = createdPOData.CreationDate ? convertODataDateToISO(createdPOData.CreationDate) : ''; // Function needed for date conversion
-            targetObject.CreatedByUser = createdPOData.CreatedByUser || '';
-            targetObject.IsEndOfPurposeBlocked = createdPOData.IsEndOfPurposeBlocked || '';
-            // Convert boolean to string "false" or "true" if necessary, otherwise use the value or an empty string
-            targetObject.PurchasingCompletenessStatus = String(createdPOData.PurchasingCompletenessStatus || false);
-            targetObject.CashDiscount1Days = createdPOData.CashDiscount1Days || '0';
-            targetObject.PurchaseOrderType = createdPOData.PurchaseOrderType || '';
-            targetObject.PurchasingOrganization = createdPOData.PurchasingOrganization || '';
-            targetObject.PurchasingDocumentDeletionCode = createdPOData.PurchasingDocumentDeletionCode || '';
-            targetObject.NetPaymentDays = createdPOData.NetPaymentDays || '0';
-            targetObject.ManualSupplierAddressID = createdPOData.ManualSupplierAddressID || '';
-            targetObject.IncotermsVersion = createdPOData.IncotermsVersion || '';
-            targetObject.AddressRegion = createdPOData.AddressRegion || '';
-            targetObject.PurchasingGroup = createdPOData.PurchasingGroup || '';
-            targetObject.IncotermsClassification = createdPOData.IncotermsClassification || '';
-            targetObject.AddressName = createdPOData.AddressName || '';
-            targetObject.InvoicingParty = createdPOData.InvoicingParty || '';
-            targetObject.SupplyingPlant = createdPOData.SupplyingPlant || '';
-            targetObject.PurchasingDocumentOrigin = createdPOData.PurchasingDocumentOrigin || '';
-            targetObject.AddressCityName = createdPOData.AddressCityName || '';
-            targetObject.AddressStreetName = createdPOData.AddressStreetName || '';
-            targetObject.CashDiscount2Percent = createdPOData.CashDiscount2Percent || '0.000';
-            targetObject.ValidityStartDate = createdPOData.ValidityStartDate ? convertODataDateToISO(createdPOData.ValidityStartDate) : '';
-            targetObject.ExchangeRate = createdPOData.ExchangeRate || '0.00000';
-            targetObject.SupplyingSupplier = createdPOData.SupplyingSupplier || '';
-            targetObject.PaymentTerms = createdPOData.PaymentTerms || '';
-            targetObject.AddressCountry = createdPOData.AddressCountry || '';
-            targetObject.AddressPostalCode = createdPOData.AddressPostalCode || '';
-            targetObject.PurchaseOrderSubtype = createdPOData.PurchaseOrderSubtype || '';
-            targetObject.Language = createdPOData.Language || '';
-            targetObject.SupplierRespSalesPersonName = createdPOData.SupplierRespSalesPersonName || '';
-            targetObject.SupplierQuotationExternalID = createdPOData.SupplierQuotationExternalID || '';
-            targetObject.Supplier = createdPOData.Supplier || '';
-            targetObject.ValidityEndDate = createdPOData.ValidityEndDate ? convertODataDateToISO(createdPOData.ValidityEndDate) : '';
-            targetObject.IncotermsLocation2 = createdPOData.IncotermsLocation2 || '';
-            targetObject.IncotermsLocation1 = createdPOData.IncotermsLocation1 || '';
-            targetObject.AddressFaxNumber = createdPOData.AddressFaxNumber || '';
-            targetObject.AddressPhoneNumber = createdPOData.AddressPhoneNumber || '';
-            targetObject.AddressCorrespondenceLanguage = createdPOData.AddressCorrespondenceLanguage || '';
-            targetObject.DocumentCurrency = createdPOData.DocumentCurrency || '';
-            targetObject.ReleaseIsNotCompleted = String(createdPOData.ReleaseIsNotCompleted || false);
-            // Note: Your desired format shows 'PurchaseOrderDate' field holding the PO number:
-            // "PurchaseOrderDate": "6900000858", 
-            // If this is a mistake and it should be the date, use 'convertODataDateToISO(createdPOData.PurchaseOrderDate)'.
-            // Based *strictly* on your desired output, we map the PO number here:
-            targetObject.PurchaseOrderDate = createdPOData.PurchaseOrderDate; // Mapped to PO number based on the example.
-
-            targetObject.PurchasingProcessingStatus = createdPOData.PurchasingProcessingStatus || '';
-            targetObject.PurchaseOrder = poNumber;
-            targetObject.LastChangeDateTime = createdPOData.LastChangeDateTime ? convertODataDateToISO(createdPOData.LastChangeDateTime) : '';
-            targetObject.SupplierPhoneNumber = createdPOData.SupplierPhoneNumber || '';
-            targetObject.CashDiscount2Days = createdPOData.CashDiscount2Days || '0';
-            targetObject.CompanyCode = createdPOData.CompanyCode || '';
-            targetObject.CashDiscount1Percent = createdPOData.CashDiscount1Percent || '0.000';
-            targetObject.AddressHouseNumber = createdPOData.AddressHouseNumber || '';
-
-            // This helper function is crucial for transforming SAP/OData date format to standard ISO 8601 string.
-            // You MUST define this function somewhere in your file.
-            function convertODataDateToISO(odataDateString) {
-                if (!odataDateString || odataDateString.includes('null')) return '';
-                // Extracts the millisecond timestamp from /Date(1762732800000)/
-                const match = odataDateString.match(/\/Date\((\d+)\)\//);
-                if (match) {
-                    const timestamp = parseInt(match[1], 10);
-                    // Create Date object and format to ISO-like string
-                    return new Date(timestamp).toISOString().split('.')[0] + '.000';
-                }
-                return ''; // Return empty string for invalid dates
-            }
-
-            // Return the transformed response structure
             return res.status(201).json(transformedResponse);
 
         } catch (error) {
-            console.error('PO creation error:', error);
+            console.error("PO creation error:", error);
             return res.status(500).json({
                 success: false,
                 message: `Failed to create PO: ${error.message}`,
@@ -640,6 +623,8 @@ module.exports = cds.service.impl(async function () {
         }
     });
 
+
+    // generate PR Number
     app.post("/odata/v4/pr/generate", basicAuthMiddleware, async (req, res) => {
         try {
             console.log('=== PR Number Generation Started ===');
@@ -759,59 +744,51 @@ module.exports = cds.service.impl(async function () {
                 queryParams.push(`$filter=${encodeURIComponent(filterValue)}`);
             }
 
-            // 2. Pagination Handling
-            const top = req.query.top || req.query.limit || '3000';
-            queryParams.push(`$top=${top}`);
+            // 2. Pagination
+            const top = req.query.top || req.query.limit;
+            if (top) queryParams.push(`$top=${top}`);
 
-            if (req.query.skip) {
-                queryParams.push(`$skip=${req.query.skip}`);
+            if (req.query.skip || req.query['$skip']) {
+                queryParams.push(`$skip=${req.query.skip || req.query['$skip']}`);
             }
 
             // 3. Select Handling
-            if (req.query.select) {
-                queryParams.push(`$select=${encodeURIComponent(req.query.select)}`);
+            if (req.query.select || req.query['$select']) {
+                queryParams.push(`$select=${encodeURIComponent(req.query.select || req.query['$select'])}`);
             }
 
-            // 4. Construct Final URL
+            // 4. ORDER BY (Fix for random ordering)
+            if (req.query.orderby || req.query['$orderby']) {
+                queryParams.push(`$orderby=${encodeURIComponent(req.query.orderby || req.query['$orderby'])}`);
+            }
+
+            // Construct URL
             let fullUrl = url;
             if (queryParams.length > 0) {
-                fullUrl = `${url}?${queryParams.join('&')}`;
+                fullUrl = `${url}?${queryParams.join("&")}`;
             }
 
-            console.log(`[S4 Proxy] Fetching ${entity}. S/4 URL: ${fullUrl}`);
+            console.log(`[S4 Proxy] Fetching ${entity}. URL: ${fullUrl}`);
 
+            // Actual S/4 call
             const s4Response = await executeS4Request({
-                method: 'GET',
+                method: "GET",
                 url: fullUrl,
-                headers: { 'Accept': 'application/json' },
+                headers: { "Accept": "application/json" },
                 timeout: 120000
             });
 
-            let responseData;
-            if (s4Response.data?.d?.results) {
-                responseData = s4Response.data.d.results;
-            } else if (Array.isArray(s4Response.data?.value)) {
-                responseData = s4Response.data.value;
-            } else {
-                responseData = s4Response.data;
-            }
-
-            console.log(`[S4 Proxy] ${entity} fetch success. Records: ${responseData.length || 'Unknown'}`);
-
-            return res.status(200).json({
-                success: true,
-                message: `Fetched ${entity} data successfully`,
-                entity: entity,
-                data: responseData
-            });
+            // 🔥🔥 Return EXACT SAP OData V2 structure — NO modifications
+            return res.status(200).json(s4Response.data);
 
         } catch (error) {
             console.error(`[S4 Proxy] Fetch error for ${entity}:`, error.message);
             const status = error.response?.status || 500;
+
             return res.status(status).json({
-                success: false,
-                message: `Failed to fetch ${entity} data: ${error.message}`,
-                errorDetails: error.response?.data || error.message
+                error: true,
+                message: `Error fetching ${entity}`,
+                details: error.response?.data || error.message
             });
         }
     }
@@ -1261,8 +1238,7 @@ module.exports = cds.service.impl(async function () {
         }
     });
 
-
-    // Check if Approvers are Required
+    /// check if approver are required or not
     app.post("/http/PRPO/ApproverRequired", basicAuthMiddleware, async (req, res) => {
 
         const url = "/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder";
@@ -1270,33 +1246,44 @@ module.exports = cds.service.impl(async function () {
 
         try {
             const data = req.body;
-            // NOTE: I'm keeping the original PO_number extraction path from your prior request for consistency.
-            const PurchaseOrderNumber = data.context?.prRequisitionInputs?.PO_number;
+            const prRequisitionInputs = data.context?.prRequisitionInputs;
+
+            // 1. INPUT EXTRACTION
+            const PurchaseOrderNumber = prRequisitionInputs?.PO_number;
+            const inputTotalAmount = prRequisitionInputs?.TotalAmount; // Used as the comparison value
+            const headerLumpsumDiscount = prRequisitionInputs?.lumpsumDiscount || "0";
+            const inputItems = prRequisitionInputs?.Item || [];
 
             if (!PurchaseOrderNumber) {
                 return res.status(400).json({
                     success: false,
-                    message: 'Missing required field: context.PO_number'
+                    message: 'Missing required field: context.prRequisitionInputs.PO_number'
                 });
             }
 
+            if (inputItems.length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Missing required field: context.prRequisitionInputs.Item'
+                });
+            }
+
+            // 2. ODATA QUERY CONSTRUCTION (Replicating CPI's OData step)
             const filterString = `PurchaseOrder eq '${PurchaseOrderNumber}'`;
 
-            // --- MODIFICATION START ---
-            // 1. Start with the direct expansions: to_PurchaseOrderItem and to_PurchaseOrderNote
-            // 2. Use a forward slash (/) to define the nested expansions inside to_PurchaseOrderItem
-            const expandString = `to_PurchaseOrderItem/to_AccountAssignment,`
-                // `to_PurchaseOrderItem/to_PurchaseOrderItemNote,` +
-                // `to_PurchaseOrderItem/to_PurchaseOrderPricingElement,` +
-                // `to_PurchaseOrderItem/to_ScheduleLine,` 
+            // Full $select string copied directly from your CPI flow
+            const selectString = "PurchaseOrder,CompanyCode,PurchaseOrderType,Language,Supplier,ExchangeRate,PaymentTerms,PurchasingGroup,DocumentCurrency,PurchaseOrderDate,to_PurchaseOrderItem/Plant,to_PurchaseOrderItem/ProductType,to_PurchaseOrderItem/MaterialGroup,to_PurchaseOrderItem/OrderQuantity,to_PurchaseOrderItem/NetPriceAmount,to_PurchaseOrderItem/OrderPriceUnit,to_PurchaseOrderItem/DocumentCurrency,to_PurchaseOrderItem/NetPriceQuantity,to_PurchaseOrderItem/PurchaseOrderItem,to_PurchaseOrderItem/RequisitionerName,to_PurchaseOrderItem/to_AccountAssignment/Quantity,to_PurchaseOrderItem/to_AccountAssignment/GLAccount,to_PurchaseOrderItem/to_AccountAssignment/CostCenter,to_PurchaseOrderItem/PurchaseOrder,to_PurchaseOrderItem/to_AccountAssignment/PurchaseOrder,to_PurchaseOrderItem/to_AccountAssignment/PurchaseOrderItem,to_PurchaseOrderItem/to_AccountAssignment/AccountAssignmentNumber,to_PurchaseOrderItem/PurchaseOrderItemText,to_PurchaseOrderItem/AccountAssignmentCategory,to_PurchaseOrderItem/PurchaseOrderItemCategory,to_PurchaseOrderItem/PurchaseOrderQuantityUnit,to_PurchaseOrderItem/OrdPriceUnitToOrderUnitDnmntr,to_PurchaseOrderItem/OrderPriceUnitToOrderUnitNmrtr,ReleaseIsNotCompleted,PurchasingOrganization,PurchasingDocumentOrigin,PurchasingCompletenessStatus";
+
+            // Correct OData V2 expansion syntax: Parent and Child Navigations separated by commas.
+            const expandString = `to_PurchaseOrderItem,to_PurchaseOrderItem/to_AccountAssignment`;
 
 
             const queryParams = [
                 `$filter=${encodeURIComponent(filterString)}`,
+                `$select=${encodeURIComponent(selectString)}`,
                 `$top=1`,
-                `$expand=${expandString}` // Use the new comprehensive expand string
+                `$expand=${expandString}`
             ];
-            // --- MODIFICATION END ---
 
             let fullUrl = `${url}?${queryParams.join('&')}`;
 
@@ -1309,22 +1296,89 @@ module.exports = cds.service.impl(async function () {
                 timeout: 120000
             });
 
-            // ... (rest of the code remains the same)
+            // Get the retrieved PO Data (equivalent to the 'Extract Data' step in CPI)
             let poData = s4Response.data?.d?.results?.[0] || s4Response.data?.value?.[0] || null;
 
             if (!poData) {
-                console.log(`[S4 Proxy PO Approver] ${entity} fetch successful. Records: 0`);
-            } else {
-                console.log(`[S4 Proxy PO Approver] ${entity} fetch successful. Records: 1`);
+                console.log(`[S4 Proxy PO Approver] ${entity} fetch successful. Records: 0. Skipping discount calculation.`);
+                // Return failure, but based on your original response, this fetch failure leads to a 400 response above.
+                // If the PO doesn't exist, you might need a different failure message here.
+                return res.status(404).json({
+                    success: false,
+                    message: `Purchase Order ${PurchaseOrderNumber} not found in S/4 HANA.`
+                });
             }
 
+            console.log(`[S4 Proxy PO Approver] ${entity} fetch successful. Records: 1.`);
+
+
+            // 3. BUSINESS LOGIC EMULATION (Replicating the second Groovy Script)
+            let calculatedTotalAmount = 0.0;
+            const headerDiscountPct = parseFloat(headerLumpsumDiscount) || 0.0;
+
+            // const poInputItem = poData?.to_PurchaseOrderItem?.results;
+
+            inputItems.forEach(item => {
+                const qty = parseFloat(item.Quantity) || 0.0;
+                const unitPrice = parseFloat(item.UnitPrice) || 0.0;
+                let finalLineAmount = qty * unitPrice; // Start with the line total
+
+                const lineDiscountPct = parseFloat(item.Discount) || 0.0;
+                const lineDiscountAmtStr = item.DiscountAmt === "" ? "0" : item.DiscountAmt;
+                const lineDiscountAmt = parseFloat(lineDiscountAmtStr) || 0.0;
+
+                // Calculate discount logic exactly as in your Groovy script
+
+                // CASE 1 & 2 → Percentage Discount
+                if (lineDiscountPct > 0 && lineDiscountAmt === 0) {
+                    finalLineAmount -= (unitPrice * lineDiscountPct / 100);
+
+                    if (headerDiscountPct > 0) {
+                        finalLineAmount -= (unitPrice * headerDiscountPct / 100);
+                    }
+                }
+                // CASE 3 → Amount Discount
+                else if (lineDiscountAmt > 0 && lineDiscountPct === 0) {
+                    finalLineAmount -= lineDiscountAmt;
+                    // Header discount is ignored in this case
+                }
+                // CASE 4 → Mixed lines
+                else if ((lineDiscountPct > 0 || lineDiscountAmt > 0) && headerDiscountPct > 0) {
+                    if (lineDiscountPct > 0) {
+                        finalLineAmount -= (unitPrice * lineDiscountPct / 100);
+                    }
+                    if (lineDiscountAmt > 0) {
+                        finalLineAmount -= lineDiscountAmt;
+                    }
+                }
+
+                calculatedTotalAmount += finalLineAmount;
+            });
+
+            // Round the total amount to avoid floating-point errors in comparison
+            calculatedTotalAmount = Math.round(calculatedTotalAmount * 100) / 100;
+            const predefinedSumAmount = parseFloat(inputTotalAmount) || 0.0;
+
+            let PoTotalAmt = 0;
+            poData.to_PurchaseOrderItem.results.forEach((ele) => {
+                PoTotalAmt += parseFloat(ele.NetPriceAmount)
+            })
+            const approverRequired = (calculatedTotalAmount === PoTotalAmt) ? "false" : "true";
+
             return res.status(200).json({
-                "poData": poData
+                // "poData": poData,
+                "Response": {
+                    "ApproverRequired": approverRequired,
+                    "TotalAmount": PoTotalAmt.toFixed(2),
+                    "PredefinedSumAmount": calculatedTotalAmount.toFixed(2)
+                }
             });
 
         } catch (error) {
             console.error(`[S4 Proxy PO Approver] Fetch error for ${entity}:`, error.message);
             const status = error.response?.status || 500;
+
+            // This is the structure you were seeing for the 400 error.
             return res.status(status).json({
                 success: false,
                 message: `Failed to fetch ${entity} data: ${error.message}`,
@@ -1333,323 +1387,464 @@ module.exports = cds.service.impl(async function () {
         }
     });
 
+    // attachment Proxy
+    app.post("/http/PRPO/fileAttachment", basicAuthMiddleware, async (req, res) => {
+        try {
+            const payload = req.body;
 
-//  PO Update & Cancel
-app.post("/http/PRPO/Update", basicAuthMiddleware, async (req, res) => {
+            if (!payload) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid payload. Provide request body."
+                });
+            }
 
-    try {
-        console.log('=== PO Update/Cancel Started ===');
-        const poPayload = req.body;
+            // ---------------------------------------------------------
+            // 1. Extract Fields
+            // ---------------------------------------------------------
+            const {
+                Url,
+                MIMEType,
+                SemanticObject,
+                UrlDescription,
+                LinkedSAPObjectKey,
+                BusinessObjectTypeName
+            } = payload;
 
-        // Validation check for mandatory input structure
-        if (!poPayload || !poPayload.context || !poPayload.context.prRequisitionInputs) {
-            return res.status(400).json({
+            // Mandatory checks
+            if (!Url || !SemanticObject || !LinkedSAPObjectKey || !BusinessObjectTypeName) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Missing mandatory fields in payload."
+                });
+            }
+
+            // ---------------------------------------------------------
+            // 2. Sanitize + Encode URL (CPI logic)
+            // ---------------------------------------------------------
+            function sanitizeAndEncodeUrl(rawUrl) {
+                let url = rawUrl.replace(/[<>\[\]{}]/g, "");  // remove special chars
+                url = url.replace(/"/g, "");                 // remove double quotes
+                return encodeURIComponent(url);              // encode
+            }
+
+            const sanitizedUrl = sanitizeAndEncodeUrl(Url);
+
+            // ---------------------------------------------------------
+            // 3. Manually build the query string
+            // ---------------------------------------------------------
+            const baseUrl = "/sap/opu/odata/sap/API_CV_ATTACHMENT_SRV/CreateUrlAsAttachment";
+
+            const queryString =
+                "SemanticObject='" + SemanticObject + "'" +
+                "&LinkedSAPObjectKey='" + LinkedSAPObjectKey + "'" +
+                "&BusinessObjectTypeName='" + BusinessObjectTypeName + "'" +
+                "&Url='" + sanitizedUrl + "'" +
+                "&UrlDescription='" + UrlDescription + "'" +
+                "&MIMEType='" + MIMEType + "'";
+
+            const finalUrl = `${baseUrl}?${queryString}`;
+
+            console.log("[ATTACHMENT PROXY] Calling:", finalUrl);
+
+            // ---------------------------------------------------------
+            // 4. Axios call to S/4
+            // ---------------------------------------------------------
+            const s4Response = await executeS4Request({
+                method: "POST",
+                url: finalUrl,
+                headers: {
+                    'X-Requested-With': 'X',
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                timeout: 120000
+            });
+
+            const responseData =
+                s4Response.data?.d?.AttachmentContentSet ||
+                s4Response.data?.AttachmentContentSet ||
+                s4Response.data;
+
+            // Extract actual SAP data (ignore metadata)
+            const sap = responseData?.d || responseData;
+
+            // Convert SAP OData date: /Date(1763637844000)/ → ISO string
+            function convertODataDate(odataDate) {
+                if (!odataDate) return "";
+                const timestamp = Number(odataDate.replace("/Date(", "").replace(")/", ""));
+                return new Date(timestamp).toISOString().replace("Z", "");
+            }
+
+            // Build final structure exactly as you want
+            const finalResponse = {
+                "AttachmentContentSet": {
+                    "AttachmentContent": {
+                        WorkstationApplication: sap.WorkstationApplication,
+                        CreatedByUser: sap.CreatedByUser,
+                        ArchiveLinkRepository: sap.ArchiveLinkRepository,
+                        FileName: sap.FileName,
+                        DocumentInfoRecordDocPart: sap.DocumentInfoRecordDocPart,
+                        CreatedByUserFullName: sap.CreatedByUserFullName,
+                        SAPObjectType: sap.SAPObjectType,
+                        MimeType: sap.MimeType,
+                        Source: sap.Source,
+                        BusinessObjectTypeName: sap.BusinessObjectTypeName,
+                        LogicalDocument: sap.LogicalDocument,
+                        SAPObjectNodeType: sap.SAPObjectNodeType,
+                        ArchiveDocumentID: sap.ArchiveDocumentID,
+                        ChangedDateTime: convertODataDate(sap.ChangedDateTime),
+                        AttachmentContentHash: sap.AttachmentContentHash,
+                        HarmonizedDocumentType: sap.HarmonizedDocumentType,
+                        DocumentInfoRecordDocNumber: sap.DocumentInfoRecordDocNumber,
+                        LinkedSAPObjectKey: sap.LinkedSAPObjectKey,
+                        StorageCategory: sap.StorageCategory,
+                        DocumentURL: sap.DocumentURL,
+                        BusinessObjectType: sap.BusinessObjectType,
+                        LastChangedByUser: sap.LastChangedByUser,
+                        CreationDateTime: convertODataDate(sap.CreationDateTime),
+                        DocumentInfoRecordDocVersion: sap.DocumentInfoRecordDocVersion,
+                        Content: sap.Content,
+                        DocumentInfoRecordDocType: sap.DocumentInfoRecordDocType,
+                        LastChangedByUserFullName: sap.LastChangedByUserFullName,
+                        SemanticObject: sap.SemanticObject,
+                        AttachmentDeletionIsAllowed: sap.AttachmentDeletionIsAllowed.toString(),
+                        AttachmentRenameIsAllowed: sap.AttachmentRenameIsAllowed.toString(),
+                        FileSize: sap.FileSize
+                    }
+                }
+            };
+            return res.status(200).json(finalResponse);
+
+        } catch (error) {
+            console.error("[ATTACHMENT PROXY ERROR]", error.message);
+
+            const status = error.response?.status || 500;
+
+            return res.status(status).json({
                 success: false,
-                message: 'Invalid payload. Expecting poPayload.context.prRequisitionInputs.',
-                receivedPayload: poPayload
+                message: "Failed to create attachment: " + error.message,
+                errorDetails: error.response?.data || error.message
             });
         }
+    });
 
-        // Extract the source data object
-        const sourceData = poPayload.context.prRequisitionInputs;
-        const poNumberToUpdate = sourceData.PO_number;
+    //  PO Update & Cancel
+    app.post("/http/PRPO/Update", basicAuthMiddleware, async (req, res) => {
 
-        // *** CRITICAL VALIDATION FOR UPDATE OPERATION ***
-        if (!poNumberToUpdate) {
-            return res.status(400).json({
-                success: false,
-                message: 'Missing Purchase Order number (sourceData.PO_number) required for update operation.',
+        try {
+            console.log('=== PO Update/Cancel Started ===');
+            const poPayload = req.body;
+
+            // Validation check for mandatory input structure
+            if (!poPayload || !poPayload.context || !poPayload.context.prRequisitionInputs) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid payload. Expecting poPayload.context.prRequisitionInputs.',
+                    receivedPayload: poPayload
+                });
+            }
+
+            // Extract the source data object
+            const sourceData = poPayload.context.prRequisitionInputs;
+            const poNumberToUpdate = sourceData.PO_number;
+
+            // *** CRITICAL VALIDATION FOR UPDATE OPERATION ***
+            if (!poNumberToUpdate) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Missing Purchase Order number (sourceData.PO_number) required for update operation.',
+                });
+            }
+
+            // --- Logic Determinations ---
+            const poType = determinePurchaseOrderType(sourceData.CompanyId, sourceData.Budgeted);
+            const purchasingOrg = determinePurchasingOrganisation(sourceData.CompanyId);
+
+            // *** Validate and adjust dates to be in the future ***
+            const getValidFutureDate = (dateString) => {
+                if (!dateString) {
+                    const futureDate = new Date();
+                    futureDate.setDate(futureDate.getDate() + 30);
+                    return futureDate.toISOString().split('T')[0];
+                }
+
+                const inputDate = new Date(dateString);
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
+
+                if (inputDate < today) {
+                    console.warn(`Date ${dateString} is in the past. Setting to tomorrow.`);
+                    const tomorrow = new Date();
+                    tomorrow.setDate(tomorrow.getDate() + 1);
+                    return tomorrow.toISOString().split('T')[0];
+                }
+
+                return dateString;
+            };
+
+            // ***************************************************************
+            // STEP 1: Update PO Header (Only header fields, NO nested items)
+            // ***************************************************************
+            const headerPayload = {
+                // "Supplier": sourceData.Vendor_Recommendation || "",
+                "PurchasingGroup": sourceData.PurchasingGroup || "",
+                "DocumentCurrency": sourceData.Currency_Code || "",
+                "SupplierRespSalesPersonName": `${sourceData.PO_Request === "2"
+                    ? `${sourceData.PRNumber} - Cancel`
+                    : `${sourceData.PRNumber} - PO Updated`
+                    }`
+            };
+
+            console.log('Step 1: Updating PO Header:', poNumberToUpdate);
+
+            await executeS4Request({
+                method: 'PATCH',
+                url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder('${poNumberToUpdate}')`,
+                headers: {
+                    'X-Requested-With': 'X',
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                data: headerPayload,
+                timeout: 90000
             });
-        }
 
-        // --- Logic Determinations ---
-        const poType = determinePurchaseOrderType(sourceData.CompanyId, sourceData.Budgeted);
-        const purchasingOrg = determinePurchasingOrganisation(sourceData.CompanyId);
+            console.log('✓ PO Header updated');
 
-        // *** Validate and adjust dates to be in the future ***
-        const getValidFutureDate = (dateString) => {
-            if (!dateString) {
-                const futureDate = new Date();
-                futureDate.setDate(futureDate.getDate() + 30);
-                return futureDate.toISOString().split('T')[0];
-            }
-            
-            const inputDate = new Date(dateString);
-            const today = new Date();
-            today.setHours(0, 0, 0, 0);
-            
-            if (inputDate < today) {
-                console.warn(`Date ${dateString} is in the past. Setting to tomorrow.`);
-                const tomorrow = new Date();
-                tomorrow.setDate(tomorrow.getDate() + 1);
-                return tomorrow.toISOString().split('T')[0];
-            }
-            
-            return dateString;
-        };
+            // ***************************************************************
+            // STEP 2: Update Each Item Individually
+            // ***************************************************************
+            const itemUpdateResults = [];
 
-        // ***************************************************************
-        // STEP 1: Update PO Header (Only header fields, NO nested items)
-        // ***************************************************************
-        const headerPayload = {
-            // "Supplier": sourceData.Vendor_Recommendation || "",
-            "PurchasingGroup": sourceData.PurchasingGroup || "",
-            "DocumentCurrency": sourceData.Currency_Code || "",
-            "SupplierRespSalesPersonName": `${sourceData.PO_Request === "2" 
-                ? `${sourceData.PRNumber} - Cancel` 
-                : `${sourceData.PRNumber} - PO Updated`
-            }`
-        };
+            if (sourceData.Item && sourceData.Item.length > 0) {
+                for (let index = 0; index < sourceData.Item.length; index++) {
+                    const item = sourceData.Item[index];
+                    const itemNumber = String((index + 1) * 10).padStart(5, '0');
 
-        console.log('Step 1: Updating PO Header:', poNumberToUpdate);
-        
-        await executeS4Request({
-            method: 'PATCH',
-            url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder('${poNumberToUpdate}')`, 
-            headers: {
-                'X-Requested-With': 'X',
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            data: headerPayload,
-            timeout: 90000
-        });
+                    console.log(`Step 2.${index + 1}: Updating Item ${itemNumber}`);
 
-        console.log('✓ PO Header updated');
-
-        // ***************************************************************
-        // STEP 2: Update Each Item Individually
-        // ***************************************************************
-        const itemUpdateResults = [];
-        
-        if (sourceData.Item && sourceData.Item.length > 0) {
-            for (let index = 0; index < sourceData.Item.length; index++) {
-                const item = sourceData.Item[index];
-                const itemNumber = String((index + 1) * 10).padStart(5, '0');
-
-                console.log(`Step 2.${index + 1}: Updating Item ${itemNumber}`);
-
-                // Update Item Basic Data
-                const itemPayload = {
-                    "OrderQuantity": String(item.Quantity || 0),
-                    "NetPriceAmount": String(item.UnitPrice || 0),
-                    "PurchaseOrderItemText": item.ItemDescription || "",
-                    "MaterialGroup": item.MaterialGroup || ""
-                };
-
-                try {
-                    await executeS4Request({
-                        method: 'PATCH',
-                        url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem(PurchaseOrder='${poNumberToUpdate}',PurchaseOrderItem='${itemNumber}')`,
-                        headers: {
-                            'X-Requested-With': 'X',
-                            'Content-Type': 'application/json',
-                            'Accept': 'application/json'
-                        },
-                        data: itemPayload,
-                        timeout: 90000
-                    });
-
-                    console.log(`✓ Item ${itemNumber} basic data updated`);
-
-                    // ***************************************************************
-                    // STEP 3: Update Schedule Line for this Item
-                    // ***************************************************************
-                    const validDeliveryDate = getValidFutureDate(item.LineEstDelivDate);
-                    const scheduleLineOData = convertDateToODataFormat(validDeliveryDate);
-
-                    const scheduleLinePayload = {
-                        "ScheduleLineDeliveryDate": scheduleLineOData
+                    // Update Item Basic Data
+                    const itemPayload = {
+                        "OrderQuantity": String(item.Quantity || 0),
+                        "NetPriceAmount": String(item.UnitPrice || 0),
+                        "PurchaseOrderItemText": item.ItemDescription || "",
+                        "MaterialGroup": item.MaterialGroup || ""
                     };
 
-                    await executeS4Request({
-                        method: 'PATCH',
-                        url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurOrdScheduleLine(PurchaseOrder='${poNumberToUpdate}',PurchaseOrderItem='${itemNumber}',ScheduleLine='0001')`,
-                        headers: {
-                            'X-Requested-With': 'X',
-                            'Content-Type': 'application/json',
-                            'Accept': 'application/json'
-                        },
-                        data: scheduleLinePayload,
-                        timeout: 90000
-                    });
-
-                    console.log(`✓ Item ${itemNumber} schedule line updated`);
-
-                    // ***************************************************************
-                    // STEP 4: Update Account Assignment for this Item
-                    // ***************************************************************
-                    const accountPayload = {
-                        "Quantity": String(item.Quantity || 0),
-                        "GLAccount": item.GLaccount || "",
-                        "CostCenter": item.CostCenter || "",
-                        "MasterFixedAsset": item.AssetCode || "",
-                        "OrderID": item.NominalCode || ""
-                    };
-
-                    await executeS4Request({
-                        method: 'PATCH',
-                        url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurOrdAccountAssignment(PurchaseOrder='${poNumberToUpdate}',PurchaseOrderItem='${itemNumber}',AccountAssignmentNumber='01')`,
-                        headers: {
-                            'X-Requested-With': 'X',
-                            'Content-Type': 'application/json',
-                            'Accept': 'application/json'
-                        },
-                        data: accountPayload,
-                        timeout: 90000
-                    });
-
-                    console.log(`✓ Item ${itemNumber} account assignment updated`);
-
-                    // ***************************************************************
-                    // STEP 5: Update Pricing Element if applicable
-                    // ***************************************************************
-                    const conditionType = item.ConditionType || "";
-                    const conditionRateValue = determineConditionRateValue(
-                        conditionType, item.Discount, item.DiscountAmt,
-                        sourceData.LumpsumDiscount, sourceData.LumpsumDiscountAmt
-                    );
-
-                    if (conditionRateValue !== "0" && conditionType) {
-                        const pricingPayload = {
-                            "ConditionRateValue": conditionRateValue
-                        };
-
-                        // Note: You may need to find the existing condition record first
-                        // This is a simplified example - adjust based on your needs
+                    try {
                         await executeS4Request({
                             method: 'PATCH',
-                            url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurOrdPricingElement(PurchaseOrder='${poNumberToUpdate}',PurchaseOrderItem='${itemNumber}',PricingDocument='',PricingDocumentItem='',PricingProcedureStep='',PricingProcedureCounter='')`,
+                            url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem(PurchaseOrder='${poNumberToUpdate}',PurchaseOrderItem='${itemNumber}')`,
                             headers: {
                                 'X-Requested-With': 'X',
                                 'Content-Type': 'application/json',
                                 'Accept': 'application/json'
                             },
-                            data: pricingPayload,
+                            data: itemPayload,
                             timeout: 90000
-                        }).catch(err => {
-                            console.warn(`Pricing element update skipped for item ${itemNumber}:`, err.message);
+                        });
+
+                        console.log(`✓ Item ${itemNumber} basic data updated`);
+
+                        // ***************************************************************
+                        // STEP 3: Update Schedule Line for this Item
+                        // ***************************************************************
+                        const validDeliveryDate = getValidFutureDate(item.LineEstDelivDate);
+                        const scheduleLineOData = convertDateToODataFormat(validDeliveryDate);
+
+                        const scheduleLinePayload = {
+                            "ScheduleLineDeliveryDate": scheduleLineOData
+                        };
+
+                        await executeS4Request({
+                            method: 'PATCH',
+                            url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurOrdScheduleLine(PurchaseOrder='${poNumberToUpdate}',PurchaseOrderItem='${itemNumber}',ScheduleLine='0001')`,
+                            headers: {
+                                'X-Requested-With': 'X',
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json'
+                            },
+                            data: scheduleLinePayload,
+                            timeout: 90000
+                        });
+
+                        console.log(`✓ Item ${itemNumber} schedule line updated`);
+
+                        // ***************************************************************
+                        // STEP 4: Update Account Assignment for this Item
+                        // ***************************************************************
+                        const accountPayload = {
+                            "Quantity": String(item.Quantity || 0),
+                            "GLAccount": item.GLaccount || "",
+                            "CostCenter": item.CostCenter || "",
+                            "MasterFixedAsset": item.AssetCode || "",
+                            "OrderID": item.NominalCode || ""
+                        };
+
+                        await executeS4Request({
+                            method: 'PATCH',
+                            url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurOrdAccountAssignment(PurchaseOrder='${poNumberToUpdate}',PurchaseOrderItem='${itemNumber}',AccountAssignmentNumber='01')`,
+                            headers: {
+                                'X-Requested-With': 'X',
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json'
+                            },
+                            data: accountPayload,
+                            timeout: 90000
+                        });
+
+                        console.log(`✓ Item ${itemNumber} account assignment updated`);
+
+                        // ***************************************************************
+                        // STEP 5: Update Pricing Element if applicable
+                        // ***************************************************************
+                        const conditionType = item.ConditionType || "";
+                        const conditionRateValue = determineConditionRateValue(
+                            conditionType, item.Discount, item.DiscountAmt,
+                            sourceData.LumpsumDiscount, sourceData.LumpsumDiscountAmt
+                        );
+
+                        if (conditionRateValue !== "0" && conditionType) {
+                            const pricingPayload = {
+                                "ConditionRateValue": conditionRateValue
+                            };
+
+                            // Note: You may need to find the existing condition record first
+                            // This is a simplified example - adjust based on your needs
+                            await executeS4Request({
+                                method: 'PATCH',
+                                url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurOrdPricingElement(PurchaseOrder='${poNumberToUpdate}',PurchaseOrderItem='${itemNumber}',PricingDocument='',PricingDocumentItem='',PricingProcedureStep='',PricingProcedureCounter='')`,
+                                headers: {
+                                    'X-Requested-With': 'X',
+                                    'Content-Type': 'application/json',
+                                    'Accept': 'application/json'
+                                },
+                                data: pricingPayload,
+                                timeout: 90000
+                            }).catch(err => {
+                                console.warn(`Pricing element update skipped for item ${itemNumber}:`, err.message);
+                            });
+                        }
+
+                        itemUpdateResults.push({
+                            itemNumber,
+                            success: true,
+                            message: 'Item updated successfully'
+                        });
+
+                    } catch (itemError) {
+                        console.error(`Error updating item ${itemNumber}:`, itemError.message);
+                        itemUpdateResults.push({
+                            itemNumber,
+                            success: false,
+                            error: itemError.message
                         });
                     }
-
-                    itemUpdateResults.push({
-                        itemNumber,
-                        success: true,
-                        message: 'Item updated successfully'
-                    });
-
-                } catch (itemError) {
-                    console.error(`Error updating item ${itemNumber}:`, itemError.message);
-                    itemUpdateResults.push({
-                        itemNumber,
-                        success: false,
-                        error: itemError.message
-                    });
                 }
             }
-        }
 
-        console.log('✓ All updates completed for PO:', poNumberToUpdate);
+            console.log('✓ All updates completed for PO:', poNumberToUpdate);
 
-        // ***************************************************************
-        // STEP 6: Fetch the updated PO to return current state
-        // ***************************************************************
-        const poResponse = await executeS4Request({
-            method: 'GET',
-            url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder('${poNumberToUpdate}')`,
-            headers: {
-                'Accept': 'application/json'
-            },
-            timeout: 90000
-        });
+            // ***************************************************************
+            // STEP 6: Fetch the updated PO to return current state
+            // ***************************************************************
+            const poResponse = await executeS4Request({
+                method: 'GET',
+                url: `/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder('${poNumberToUpdate}')`,
+                headers: {
+                    'Accept': 'application/json'
+                },
+                timeout: 90000
+            });
 
-        // --- Response Transformation Logic ---
-        function convertODataDateToISO(odataDateString) {
-            if (!odataDateString || odataDateString.includes('null')) return '';
-            const match = odataDateString.match(/\/Date\((\d+)\)\//);
-            if (match) {
-                const timestamp = parseInt(match[1], 10);
-                return new Date(timestamp).toISOString().split('.')[0] + '.000';
+            // --- Response Transformation Logic ---
+            function convertODataDateToISO(odataDateString) {
+                if (!odataDateString || odataDateString.includes('null')) return '';
+                const match = odataDateString.match(/\/Date\((\d+)\)\//);
+                if (match) {
+                    const timestamp = parseInt(match[1], 10);
+                    return new Date(timestamp).toISOString().split('.')[0] + '.000';
+                }
+                return '';
             }
-            return ''; 
+
+            const transformedResponse = {
+                A_PurchaseOrder: {
+                    A_PurchaseOrderType: {}
+                }
+            };
+
+            const sourceForMapping = poResponse.data?.d || poResponse.data;
+            const targetObject = transformedResponse.A_PurchaseOrder.A_PurchaseOrderType;
+
+            // Mapping properties
+            targetObject.CreationDate = sourceForMapping.CreationDate ? convertODataDateToISO(sourceForMapping.CreationDate) : '';
+            targetObject.CreatedByUser = sourceForMapping.CreatedByUser || '';
+            targetObject.IsEndOfPurposeBlocked = sourceForMapping.IsEndOfPurposeBlocked || '';
+            targetObject.PurchasingCompletenessStatus = String(sourceForMapping.PurchasingCompletenessStatus || false);
+            targetObject.CashDiscount1Days = sourceForMapping.CashDiscount1Days || '0';
+            targetObject.PurchaseOrderType = sourceForMapping.PurchaseOrderType || '';
+            targetObject.PurchasingOrganization = sourceForMapping.PurchasingOrganization || '';
+            targetObject.PurchasingDocumentDeletionCode = sourceForMapping.PurchasingDocumentDeletionCode || '';
+            targetObject.NetPaymentDays = sourceForMapping.NetPaymentDays || '0';
+            targetObject.ManualSupplierAddressID = sourceForMapping.ManualSupplierAddressID || '';
+            targetObject.IncotermsVersion = sourceForMapping.IncotermsVersion || '';
+            targetObject.AddressRegion = sourceForMapping.AddressRegion || '';
+            targetObject.PurchasingGroup = sourceForMapping.PurchasingGroup || '';
+            targetObject.IncotermsClassification = sourceForMapping.IncotermsClassification || '';
+            targetObject.AddressName = sourceForMapping.AddressName || '';
+            targetObject.InvoicingParty = sourceForMapping.InvoicingParty || '';
+            targetObject.SupplyingPlant = sourceForMapping.SupplyingPlant || '';
+            targetObject.PurchasingDocumentOrigin = sourceForMapping.PurchasingDocumentOrigin || '';
+            targetObject.AddressCityName = sourceForMapping.AddressCityName || '';
+            targetObject.AddressStreetName = sourceForMapping.AddressStreetName || '';
+            targetObject.CashDiscount2Percent = sourceForMapping.CashDiscount2Percent || '0.000';
+            targetObject.ValidityStartDate = sourceForMapping.ValidityStartDate ? convertODataDateToISO(sourceForMapping.ValidityStartDate) : '';
+            targetObject.ExchangeRate = sourceForMapping.ExchangeRate || '0.00000';
+            targetObject.SupplyingSupplier = sourceForMapping.SupplyingSupplier || '';
+            targetObject.PaymentTerms = sourceForMapping.PaymentTerms || '';
+            targetObject.AddressCountry = sourceForMapping.AddressCountry || '';
+            targetObject.AddressPostalCode = sourceForMapping.AddressPostalCode || '';
+            targetObject.PurchaseOrderSubtype = sourceForMapping.PurchaseOrderSubtype || '';
+            targetObject.Language = sourceForMapping.Language || '';
+            targetObject.SupplierRespSalesPersonName = sourceForMapping.SupplierRespSalesPersonName || '';
+            targetObject.SupplierQuotationExternalID = sourceForMapping.SupplierQuotationExternalID || '';
+            targetObject.Supplier = sourceForMapping.Supplier || '';
+            targetObject.ValidityEndDate = sourceForMapping.ValidityEndDate ? convertODataDateToISO(sourceForMapping.ValidityEndDate) : '';
+            targetObject.IncotermsLocation2 = sourceForMapping.IncotermsLocation2 || '';
+            targetObject.IncotermsLocation1 = sourceForMapping.IncotermsLocation1 || '';
+            targetObject.AddressFaxNumber = sourceForMapping.AddressFaxNumber || '';
+            targetObject.AddressPhoneNumber = sourceForMapping.AddressPhoneNumber || '';
+            targetObject.AddressCorrespondenceLanguage = sourceForMapping.AddressCorrespondenceLanguage || '';
+            targetObject.DocumentCurrency = sourceForMapping.DocumentCurrency || '';
+            targetObject.ReleaseIsNotCompleted = String(sourceForMapping.ReleaseIsNotCompleted || false);
+            targetObject.PurchasingProcessingStatus = sourceForMapping.PurchasingProcessingStatus || '';
+            targetObject.PurchaseOrder = poNumberToUpdate;
+            targetObject.LastChangeDateTime = sourceForMapping.LastChangeDateTime ? convertODataDateToISO(sourceForMapping.LastChangeDateTime) : '';
+            targetObject.SupplierPhoneNumber = sourceForMapping.SupplierPhoneNumber || '';
+            targetObject.CashDiscount2Days = sourceForMapping.CashDiscount2Days || '0';
+            targetObject.CompanyCode = sourceForMapping.CompanyCode || '';
+            targetObject.CashDiscount1Percent = sourceForMapping.CashDiscount1Percent || '0.000';
+            targetObject.AddressHouseNumber = sourceForMapping.AddressHouseNumber || '';
+
+            // Add item update summary
+            transformedResponse.itemUpdateResults = itemUpdateResults;
+
+            // Return the transformed response structure
+            return res.status(200).json(transformedResponse);
+
+        } catch (error) {
+            console.error('PO update error:', error);
+            return res.status(500).json({
+                success: false,
+                message: `Failed to update PO: ${error.message}`,
+                error: error.response?.data || error.message
+            });
         }
-        
-        const transformedResponse = {
-            A_PurchaseOrder: {
-                A_PurchaseOrderType: {}
-            }
-        };
-
-        const sourceForMapping = poResponse.data?.d || poResponse.data;
-        const targetObject = transformedResponse.A_PurchaseOrder.A_PurchaseOrderType;
-
-        // Mapping properties
-        targetObject.CreationDate = sourceForMapping.CreationDate ? convertODataDateToISO(sourceForMapping.CreationDate) : ''; 
-        targetObject.CreatedByUser = sourceForMapping.CreatedByUser || '';
-        targetObject.IsEndOfPurposeBlocked = sourceForMapping.IsEndOfPurposeBlocked || '';
-        targetObject.PurchasingCompletenessStatus = String(sourceForMapping.PurchasingCompletenessStatus || false);
-        targetObject.CashDiscount1Days = sourceForMapping.CashDiscount1Days || '0';
-        targetObject.PurchaseOrderType = sourceForMapping.PurchaseOrderType || '';
-        targetObject.PurchasingOrganization = sourceForMapping.PurchasingOrganization || '';
-        targetObject.PurchasingDocumentDeletionCode = sourceForMapping.PurchasingDocumentDeletionCode || '';
-        targetObject.NetPaymentDays = sourceForMapping.NetPaymentDays || '0';
-        targetObject.ManualSupplierAddressID = sourceForMapping.ManualSupplierAddressID || '';
-        targetObject.IncotermsVersion = sourceForMapping.IncotermsVersion || '';
-        targetObject.AddressRegion = sourceForMapping.AddressRegion || '';
-        targetObject.PurchasingGroup = sourceForMapping.PurchasingGroup || '';
-        targetObject.IncotermsClassification = sourceForMapping.IncotermsClassification || '';
-        targetObject.AddressName = sourceForMapping.AddressName || '';
-        targetObject.InvoicingParty = sourceForMapping.InvoicingParty || '';
-        targetObject.SupplyingPlant = sourceForMapping.SupplyingPlant || '';
-        targetObject.PurchasingDocumentOrigin = sourceForMapping.PurchasingDocumentOrigin || '';
-        targetObject.AddressCityName = sourceForMapping.AddressCityName || '';
-        targetObject.AddressStreetName = sourceForMapping.AddressStreetName || '';
-        targetObject.CashDiscount2Percent = sourceForMapping.CashDiscount2Percent || '0.000';
-        targetObject.ValidityStartDate = sourceForMapping.ValidityStartDate ? convertODataDateToISO(sourceForMapping.ValidityStartDate) : '';
-        targetObject.ExchangeRate = sourceForMapping.ExchangeRate || '0.00000';
-        targetObject.SupplyingSupplier = sourceForMapping.SupplyingSupplier || '';
-        targetObject.PaymentTerms = sourceForMapping.PaymentTerms || '';
-        targetObject.AddressCountry = sourceForMapping.AddressCountry || '';
-        targetObject.AddressPostalCode = sourceForMapping.AddressPostalCode || '';
-        targetObject.PurchaseOrderSubtype = sourceForMapping.PurchaseOrderSubtype || '';
-        targetObject.Language = sourceForMapping.Language || '';
-        targetObject.SupplierRespSalesPersonName = sourceForMapping.SupplierRespSalesPersonName || '';
-        targetObject.SupplierQuotationExternalID = sourceForMapping.SupplierQuotationExternalID || '';
-        targetObject.Supplier = sourceForMapping.Supplier || '';
-        targetObject.ValidityEndDate = sourceForMapping.ValidityEndDate ? convertODataDateToISO(sourceForMapping.ValidityEndDate) : '';
-        targetObject.IncotermsLocation2 = sourceForMapping.IncotermsLocation2 || '';
-        targetObject.IncotermsLocation1 = sourceForMapping.IncotermsLocation1 || '';
-        targetObject.AddressFaxNumber = sourceForMapping.AddressFaxNumber || '';
-        targetObject.AddressPhoneNumber = sourceForMapping.AddressPhoneNumber || '';
-        targetObject.AddressCorrespondenceLanguage = sourceForMapping.AddressCorrespondenceLanguage || '';
-        targetObject.DocumentCurrency = sourceForMapping.DocumentCurrency || '';
-        targetObject.ReleaseIsNotCompleted = String(sourceForMapping.ReleaseIsNotCompleted || false);
-        targetObject.PurchasingProcessingStatus = sourceForMapping.PurchasingProcessingStatus || '';
-        targetObject.PurchaseOrder = poNumberToUpdate;
-        targetObject.LastChangeDateTime = sourceForMapping.LastChangeDateTime ? convertODataDateToISO(sourceForMapping.LastChangeDateTime) : '';
-        targetObject.SupplierPhoneNumber = sourceForMapping.SupplierPhoneNumber || '';
-        targetObject.CashDiscount2Days = sourceForMapping.CashDiscount2Days || '0';
-        targetObject.CompanyCode = sourceForMapping.CompanyCode || '';
-        targetObject.CashDiscount1Percent = sourceForMapping.CashDiscount1Percent || '0.000';
-        targetObject.AddressHouseNumber = sourceForMapping.AddressHouseNumber || '';
-
-        // Add item update summary
-        transformedResponse.itemUpdateResults = itemUpdateResults;
-
-        // Return the transformed response structure
-        return res.status(200).json(transformedResponse);
-
-    } catch (error) {
-        console.error('PO update error:', error);
-        return res.status(500).json({
-            success: false,
-            message: `Failed to update PO: ${error.message}`,
-            error: error.response?.data || error.message
-        });
-    }
-});
+    });
 
 
-   
+
 
 });
